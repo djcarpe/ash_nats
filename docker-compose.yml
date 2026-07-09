@@ -1,0 +1,21 @@
+services:
+  nats:
+    image: nats:latest
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  livebook:
+    image: ghcr.io/livebook-dev/livebook
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    environment:
+      LIVEBOOK_TOKEN_ENABLED: "false"
+      LIVEBOOK_HOME: "/data"
+      NATS_HOST: "nats"
+    volumes:
+      - .:/data
+    depends_on:
+      - nats

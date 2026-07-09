@@ -1,0 +1,426 @@
+# AshNats: NATS Messaging for Ash Resources
+
+```elixir
+Application.put_env(:ash, :validate_domain_resource_inclusion?, false)
+Application.put_env(:ash, :validate_domain_config_inclusion?, false)
+
+Mix.install(
+  [
+    {:ash_nats, path: "/data/"},
+    {:ash, "~> 3.0"},
+    {:gnat, "~> 1.8"},
+    {:jason, "~> 1.4"},
+    {:decimal, "~> 2.0"}
+  ],
+  consolidate_protocols: false
+)
+```
+
+## What Is AshNats?
+
+`AshNats` wires Ash resources into [NATS](https://nats.io), a lightweight, high-performance messaging system. It adds two complementary capabilities to any resource:
+
+**Publications** — after an action commits, publish a JSON event to a NATS subject. Downstream consumers (billing, notifications, analytics, other services) react without the resource knowing about them. Core mode is fire-and-forget; JetStream mode adds publish acknowledgement.
+
+**Exposures** — serve an action over NATS request/reply. Callers send a JSON payload to a subject; the server decodes it, runs the Ash action, and replies with the result. This turns any Ash action into a lightweight RPC endpoint without HTTP.
+
+Both are declared in a single `nats do … end` DSL block.
+
+## The Domain: Order Fulfilment
+
+We'll model a small order system. Orders are created and shipped. Multiple downstream services care about those events, and a mobile client needs to list and create orders over NATS request/reply.
+
+```elixir
+defmodule Demo.Order do
+  use Ash.Resource,
+    domain: Demo,
+    data_layer: Ash.DataLayer.Ets,
+    extensions: [AshNats]
+
+  nats do
+    # Registered name of the Gnat connection (or ConnectionSupervisor).
+    # Gnat.pub/4 is called on this name at publish time.
+    connection :gnat
+
+    # Prepended (dot-separated) to every outgoing subject.
+    subject_prefix "demo.orders"
+
+    # publish_all matches every action of the given *type* (:create / :update / :destroy).
+    # Atom segments in the subject list are resolved from the record at runtime.
+    publish_all :create, ["orders", :id, "created"],
+      headers: fn _notification -> [{"x-source", "ash-nats-demo"}] end
+
+    # publish matches a specific action *name*.
+    publish :ship, ["orders", :id, "shipped"]
+
+    # Publish JetStream with an ack — and add a deduplication header.
+    publish :cancel, ["orders", :id, "cancelled"],
+      mode: :jetstream,
+      msg_id: [:id, "cancelled"]
+
+    # Expose :read over NATS request/reply.
+    expose :read, subject: "orders.list"
+
+    # Expose :create — callers POST JSON, get the new record back.
+    expose :create, subject: "orders.create"
+  end
+
+  attributes do
+    uuid_primary_key :id
+
+    attribute :customer_id, :string,
+      allow_nil?: false,
+      public?: true
+
+    attribute :status, :atom,
+      constraints: [one_of: [:pending, :shipped, :cancelled]],
+      default: :pending,
+      public?: true
+
+    attribute :total_cents, :integer,
+      public?: true
+
+    create_timestamp :inserted_at
+    update_timestamp :updated_at
+  end
+
+  actions do
+    defaults [:read, :destroy]
+
+    create :create do
+      accept [:customer_id, :total_cents]
+    end
+
+    update :ship do
+      accept []
+      change set_attribute(:status, :shipped)
+    end
+
+    update :cancel do
+      accept []
+      change set_attribute(:status, :cancelled)
+    end
+  end
+end
+
+defmodule Demo do
+  use Ash.Domain, validate_config_inclusion?: false
+
+  resources do
+    resource Demo.Order
+  end
+end
+```
+
+## Introspection
+
+AshNats exposes the full configuration at compile time through `AshNats.Info`. You can query subjects and exposures without a running NATS server.
+
+```elixir
+# Is AshNats active on this resource?
+AshNats.Info.nats?(Demo.Order)
+```
+
+```elixir
+# Every configured publication (publish + publish_all entries)
+AshNats.Info.publications(Demo.Order)
+```
+
+```elixir
+# Every configured exposure
+AshNats.Info.exposures(Demo.Order)
+```
+
+```elixir
+# The Gnat connection name
+AshNats.Info.connection(Demo.Order)
+```
+
+```elixir
+# Subject prefix
+AshNats.Info.subject_prefix(Demo.Order)
+```
+
+```elixir
+# Kill-switch — false would silence all publications
+AshNats.Info.publish?(Demo.Order)
+```
+
+## Publications in Action
+
+`AshNats.Notifier` is an `Ash.Notifier` that runs automatically after each transaction commits. You never call it directly.
+
+When `Ash.create/1` succeeds it:
+
+1. Checks which `publish` / `publish_all` entries match the action (by type or name)
+2. Builds the NATS subject — `prefix` + resolved segment list (atom segments become field values from the record)
+3. JSON-encodes a standard event envelope
+4. Calls `Gnat.pub/4` (core) or `Gnat.request/4` (JetStream)
+
+If the NATS connection is not running the notifier logs a warning and continues — your Ash action is never rolled back due to a messaging failure.
+
+```elixir
+# Create an order. The :gnat connection doesn't exist in this notebook,
+# so the notifier will log a warning — but the create succeeds.
+{:ok, order} =
+  Demo.Order
+  |> Ash.Changeset.for_create(:create, %{customer_id: "cust_42", total_cents: 4_999})
+  |> Ash.create()
+
+order
+```
+
+```elixir
+# Ship it — triggers the :ship publication to "demo.orders.orders.<id>.shipped"
+{:ok, shipped_order} =
+  order
+  |> Ash.Changeset.for_update(:ship, %{})
+  |> Ash.update()
+
+shipped_order.status
+```
+
+### What the NATS message looks like
+
+The subject resolves atom segments from the record and joins with `.`:
+
+```
+demo.orders.orders.3fa85f64-5717-4562-b3fc-2c963f66afa6.shipped
+```
+
+The JSON body is:
+
+```json
+{
+  "event":       "order.ship",
+  "resource":    "order",
+  "action":      "ship",
+  "type":        "update",
+  "data":        { "id": "3fa8…", "customer_id": "cust_42", "status": "shipped", "total_cents": 4999 },
+  "metadata":    {},
+  "occurred_at": "2026-06-16T12:00:00.000000Z"
+}
+```
+
+The `event` field defaults to `"<resource_short_name>.<action_name>"`. Override it per-publication:
+
+```elixir
+# When event: is not set, pub.event is nil and the notifier falls back to
+# "<resource>.<action_name>". Inspect the :ship publication to confirm:
+pub = AshNats.Info.publications(Demo.Order) |> Enum.find(&(&1.action == :ship))
+%{event: pub.event, default_would_be: "order.ship"}
+# Override: publish :ship, [...], event: "order.fulfillment.shipped"
+```
+
+## Matching Logic
+
+The notifier filters publications by comparing the completed action against each entry:
+
+* If `publication.action` is `:create`, `:update`, or `:destroy` → match by **action type**
+* Otherwise → match by **action name**
+
+`publish_all :create, …` therefore fires for *every* create action on the resource (`:create`, or a custom `create :register`), while `publish :ship, …` fires only for the action named `:ship`.
+
+```elixir
+# See how matching works with the actual notifier logic:
+action_create = %{type: :create, name: :create}
+action_ship   = %{type: :update, name: :ship}
+
+publications = AshNats.Info.publications(Demo.Order)
+
+for pub <- publications do
+  matches_create? = case pub.action do
+    type when type in [:create, :update, :destroy] -> action_create.type == type
+    name -> action_create.name == name
+  end
+
+  matches_ship? = case pub.action do
+    type when type in [:create, :update, :destroy] -> action_ship.type == type
+    name -> action_ship.name == name
+  end
+
+  "publish #{inspect(pub.action)} → create? #{matches_create?}, ship? #{matches_ship?}"
+end
+```
+
+## Serialization
+
+`AshNats.Serializer` converts Ash records into JSON-safe, string-keyed maps. Public attributes are included; unloaded relationships and forbidden fields serialize as `nil`.
+
+```elixir
+AshNats.Serializer.serialize(shipped_order)
+```
+
+```elixir
+# Lists work too
+{:ok, all_orders} = Ash.read(Demo.Order)
+AshNats.Serializer.serialize(all_orders)
+```
+
+## Request / Reply (Exposures)
+
+Exposures are served by a module built with `AshNats.Rpc.Server`. The macro generates `request/1` and `error/2` callbacks for `Gnat.Server`, and a `subscription_topics/0` helper to drive the supervisor.
+
+```elixir
+defmodule Demo.NatsServer do
+  use AshNats.Rpc.Server,
+    domains: [Demo],
+    # Optional: resolve actor / tenant / context from request headers.
+    # context: {Demo.Auth, :resolve_context},
+    # Optional: mirror these headers onto the reply (for trace correlation).
+    passthrough_headers: ["x-request-id", "traceparent"]
+end
+
+# Subjects this server subscribes to
+Demo.NatsServer.subscription_topics()
+```
+
+```elixir
+# Compute the full subject for each exposure
+Demo.Order
+|> AshNats.Info.exposures()
+|> Enum.map(fn exposure ->
+  subject = AshNats.Info.exposure_subject(Demo.Order, exposure)
+  "#{exposure.action} → #{subject}"
+end)
+```
+
+### Supervision
+
+```elixir
+{:ok, _} =
+  Supervisor.start_link(
+    [
+      {Gnat.ConnectionSupervisor, %{
+        name: :gnat,
+        connection_settings: [%{host: System.get_env("NATS_HOST", "localhost"), port: 4222}]
+      }},
+      {Gnat.ConsumerSupervisor, %{
+        connection_name: :gnat,
+        module: Demo.NatsServer,
+        subscription_topics:
+          Enum.map(Demo.NatsServer.subscription_topics(), &%{topic: &1})
+      }}
+    ],
+    strategy: :one_for_one
+  )
+```
+
+### Client
+
+`AshNats.Rpc.Client.request/4` encodes input as JSON, sends it to the subject, and unwraps the reply envelope.
+
+```elixir
+{:ok, orders, _} =
+  AshNats.Rpc.Client.request(:gnat, "demo.orders.orders.list", %{})
+
+{:ok, rpc_order, reply_headers} =
+  AshNats.Rpc.Client.request(:gnat, "demo.orders.orders.create",
+    %{"customer_id" => "cust_99", "total_cents" => 2500},
+    headers: [{"x-request-id", "req-abc"}]
+  )
+
+{length(orders), rpc_order["customer_id"], reply_headers}
+```
+
+### Reply envelope
+
+Success:
+
+```json
+{ "ok": true,  "data": { "id": "…", "customer_id": "cust_99", … } }
+```
+
+Error:
+
+```json
+{ "ok": false, "error": { "class": "invalid", "message": "customer_id is required" } }
+```
+
+## JetStream & Custom Headers
+
+JetStream mode adds publish acknowledgement. The notifier calls `Gnat.request/4` and inspects the PubAck — if the stream rejects the message (e.g. wrong subject) it logs an error.
+
+`Demo.Order` configures `:cancel` as a JetStream publication with a `Nats-Msg-Id` deduplication header built from `[:id, "cancelled"]`.
+
+Before cancelling, create a JetStream stream that covers the `demo.orders.>` subject:
+
+```elixir
+stream_config = %{
+  name: "ORDERS",
+  subjects: ["demo.orders.>"]
+}
+
+{:ok, _reply} = Gnat.request(:gnat, "$JS.API.STREAM.CREATE.ORDERS", Jason.encode!(stream_config))
+:stream_created
+```
+
+```elixir
+# Cancel triggers Gnat.request/4; NATS replies with a PubAck (or an error if
+# the subject isn't bound to a JetStream stream, which logs but doesn't fail).
+{:ok, cancelled} =
+  shipped_order
+  |> Ash.Changeset.for_update(:cancel, %{})
+  |> Ash.update()
+
+cancelled.status
+```
+
+Custom NATS headers are static lists or functions called with the full notification. `Demo.Order` attaches `x-source` on every create:
+
+```elixir
+# Introspect the headers function on the create publication.
+AshNats.Info.publications(Demo.Order)
+|> Enum.find(&(&1.action == :create))
+|> then(fn pub -> pub.headers end)
+```
+
+## Custom Encoders
+
+Swap JSON for Protobuf or MessagePack by implementing `AshNats.Encoder`. Here's a working encoder that pretty-prints events (useful for debugging) while keeping compact replies:
+
+```elixir
+defmodule Demo.PrettyEncoder do
+  @behaviour AshNats.Encoder
+
+  @impl true
+  def encode_event(event), do: {:ok, Jason.encode!(event, pretty: true)}
+
+  @impl true
+  def decode_request(""), do: {:ok, %{}}
+  def decode_request(bin) do
+    case Jason.decode(bin) do
+      {:ok, %{} = m} -> {:ok, m}
+      {:ok, other} -> {:error, {:invalid_request, other}}
+      {:error, _} = e -> e
+    end
+  end
+
+  @impl true
+  def encode_response(reply), do: Jason.encode(reply)
+end
+
+# Try it directly — the same function the notifier calls before publishing.
+{:ok, payload} =
+  Demo.PrettyEncoder.encode_event(%{
+    "event" => "order.ship",
+    "resource" => "order",
+    "data" => %{"id" => "abc-123", "status" => "shipped"}
+  })
+
+IO.puts(payload)
+```
+
+## Summary
+
+| Capability               | DSL                       | Runtime                                          |
+| ------------------------ | ------------------------- | ------------------------------------------------ |
+| Fire-and-forget publish  | `publish` / `publish_all` | `AshNats.Notifier` → `Gnat.pub/4`              |
+| Durable publish-with-ack | `mode: :jetstream`        | `AshNats.Notifier` → `Gnat.request/4`          |
+| Deduplication            | `msg_id:`                 | Sets `Nats-Msg-Id` header                        |
+| Request/reply RPC server | `expose`                  | `AshNats.Rpc.Server` + `Gnat.ConsumerSupervisor` |
+| RPC client               | —                       | `AshNats.Rpc.Client.request/4`                   |
+| Payload encoding         | `encoder:`                | `AshNats.Encoder` behaviour                      |
+| Per-message headers      | `headers:` fn/MFA         | Resolved at publish time                         |
+
+AshNats keeps NATS out of your domain logic. Declare intent in the DSL; the notifier and server do the rest. When NATS isn't running, publications log a warning and actions still succeed.
