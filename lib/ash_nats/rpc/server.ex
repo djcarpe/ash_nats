@@ -49,6 +49,8 @@ defmodule AshNats.Rpc.Server do
 
   require Logger
 
+  alias AshNats.Rpc.ErrorSerializer
+
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
       use Gnat.Server
@@ -86,21 +88,32 @@ defmodule AshNats.Rpc.Server do
     case Map.fetch(routes(domains), topic) do
       {:ok, {domain, resource, exposure}} ->
         encoder = AshNats.Info.encoder(resource)
+        metadata = %{resource: resource, action: exposure.action, subject: topic}
 
         reply =
-          case encoder.decode_request(body) do
-            {:ok, input} ->
-              ash_opts = build_ash_opts(server_opts[:context], message, domain)
-              run(resource, exposure, input, ash_opts)
+          :telemetry.span([:ash_nats, :rpc], metadata, fn ->
+            reply =
+              case encoder.decode_request(body) do
+                {:ok, input} ->
+                  ash_opts = build_ash_opts(server_opts[:context], message, domain)
+                  run(resource, exposure, input, ash_opts)
 
-            {:error, reason} ->
-              error_reply("invalid_request", inspect(reason))
-          end
+                {:error, reason} ->
+                  ErrorSerializer.protocol_error("invalid_request", inspect(reason))
+              end
+
+            {reply, Map.put(metadata, :ok?, match?(%{"ok" => true}, reply))}
+          end)
 
         respond(encoder, reply, message, server_opts[:passthrough_headers])
 
       :error ->
-        respond(AshNats.Encoder.Json, error_reply("unknown_subject", topic), message, [])
+        respond(
+          AshNats.Encoder.Json,
+          ErrorSerializer.protocol_error("unknown_subject", topic),
+          message,
+          []
+        )
     end
   end
 
@@ -109,7 +122,7 @@ defmodule AshNats.Rpc.Server do
 
     respond(
       AshNats.Encoder.Json,
-      error_reply("internal_error", "unhandled server error"),
+      ErrorSerializer.protocol_error("internal_error", "unhandled server error"),
       message,
       []
     )
@@ -197,8 +210,21 @@ defmodule AshNats.Rpc.Server do
         resource <- Ash.Domain.Info.resources(domain),
         AshNats.Info.nats?(resource),
         exposure <- AshNats.Info.exposures(resource),
-        into: %{} do
-      {AshNats.Info.exposure_subject(resource, exposure), {domain, resource, exposure}}
+        reduce: %{} do
+      routes ->
+        subject = AshNats.Info.exposure_subject(resource, exposure)
+
+        case routes do
+          %{^subject => {_domain, other_resource, other_exposure}} ->
+            raise ArgumentError,
+                  "NATS subject #{inspect(subject)} is exposed by both " <>
+                    "#{inspect(other_resource)} (action #{inspect(other_exposure.action)}) and " <>
+                    "#{inspect(resource)} (action #{inspect(exposure.action)}). " <>
+                    "Give one of them a distinct `subject:`."
+
+          _ ->
+            Map.put(routes, subject, {domain, resource, exposure})
+        end
     end
   end
 
@@ -208,56 +234,52 @@ defmodule AshNats.Rpc.Server do
     action = Ash.Resource.Info.action(resource, exposure.action)
     execute(action.type, resource, action, exposure, input, ash_opts)
   rescue
-    error -> error_reply_from(error)
+    error -> ErrorSerializer.serialize(error)
   end
 
   defp execute(:read, resource, action, exposure, input, ash_opts) do
-    query = Ash.Query.for_read(resource, action.name, input, ash_opts)
+    with {:ok, filter, input} <- get_lookup(resource, exposure, input) do
+      query =
+        resource
+        |> Ash.Query.for_read(action.name, input, ash_opts)
+        |> Ash.Query.do_filter(filter)
 
-    result =
-      if exposure.get? do
-        Ash.read_one(query)
-      else
-        Ash.read(query)
-      end
+      result =
+        if exposure.get? do
+          Ash.read_one(query)
+        else
+          Ash.read(query)
+        end
 
-    case result do
-      {:ok, data} -> ok_reply(AshNats.Serializer.serialize(data))
-      {:error, error} -> error_reply_from(error)
+      reply_with(result, exposure, ash_opts)
     end
   end
 
-  defp execute(:create, resource, action, _exposure, input, ash_opts) do
+  defp execute(:create, resource, action, exposure, input, ash_opts) do
     resource
     |> Ash.Changeset.for_create(action.name, input, ash_opts)
     |> Ash.create()
-    |> case do
-      {:ok, record} -> ok_reply(AshNats.Serializer.serialize(record))
-      {:error, error} -> error_reply_from(error)
-    end
+    |> reply_with(exposure, ash_opts)
   end
 
-  defp execute(:update, resource, action, _exposure, input, ash_opts) do
-    with {:ok, record, rest} <- fetch_record(resource, input, ash_opts) do
+  defp execute(:update, resource, action, exposure, input, ash_opts) do
+    with {:ok, record, rest} <- fetch_record(resource, exposure, input, ash_opts) do
       record
       |> Ash.Changeset.for_update(action.name, rest, ash_opts)
       |> Ash.update()
-      |> case do
-        {:ok, updated} -> ok_reply(AshNats.Serializer.serialize(updated))
-        {:error, error} -> error_reply_from(error)
-      end
+      |> reply_with(exposure, ash_opts)
     end
   end
 
-  defp execute(:destroy, resource, action, _exposure, input, ash_opts) do
-    with {:ok, record, rest} <- fetch_record(resource, input, ash_opts) do
+  defp execute(:destroy, resource, action, exposure, input, ash_opts) do
+    with {:ok, record, rest} <- fetch_record(resource, exposure, input, ash_opts) do
       record
       |> Ash.Changeset.for_destroy(action.name, rest, ash_opts)
       |> Ash.destroy()
       |> case do
         :ok -> ok_reply(nil)
         {:ok, destroyed} -> ok_reply(AshNats.Serializer.serialize(destroyed))
-        {:error, error} -> error_reply_from(error)
+        {:error, error} -> ErrorSerializer.serialize(error)
       end
     end
   end
@@ -269,49 +291,89 @@ defmodule AshNats.Rpc.Server do
     |> case do
       :ok -> ok_reply(nil)
       {:ok, result} -> ok_reply(AshNats.Serializer.serialize(result))
-      {:error, error} -> error_reply_from(error)
+      {:error, error} -> ErrorSerializer.serialize(error)
     end
   end
 
-  defp fetch_record(resource, input, ash_opts) do
-    pk_fields = Ash.Resource.Info.primary_key(resource)
-    pk_keys = Enum.map(pk_fields, &to_string/1)
-
-    pk =
-      Map.new(pk_fields, fn field ->
-        {field, Map.get(input, to_string(field))}
-      end)
-
-    if Enum.any?(pk, fn {_, v} -> is_nil(v) end) do
-      error_reply(
-        "missing_primary_key",
-        "update/destroy requests must include #{inspect(pk_keys)}"
-      )
-    else
-      case Ash.get(resource, pk, ash_opts) do
-        {:ok, record} -> {:ok, record, Map.drop(input, pk_keys)}
-        {:error, error} -> error_reply_from(error)
-      end
+  defp reply_with({:ok, data}, exposure, ash_opts) do
+    case maybe_load(data, exposure, ash_opts) do
+      {:ok, data} -> ok_reply(AshNats.Serializer.serialize(data))
+      {:error, error} -> ErrorSerializer.serialize(error)
     end
+  end
+
+  defp reply_with({:error, error}, _exposure, _ash_opts) do
+    ErrorSerializer.serialize(error)
+  end
+
+  defp maybe_load(data, %{load: load}, ash_opts) when not is_nil(load) and data != nil do
+    Ash.load(data, load, ash_opts)
+  end
+
+  defp maybe_load(data, _exposure, _ash_opts), do: {:ok, data}
+
+  ## Record lookup (primary key or identity)
+
+  # For `get?: true` reads: when all lookup keys are present in the input they
+  # become a filter and are dropped from the action input; when none are
+  # present the input passes through untouched (argument-based get actions).
+  defp get_lookup(_resource, %{get?: false}, input), do: {:ok, nil, input}
+
+  defp get_lookup(resource, exposure, input) do
+    case split_lookup(resource, exposure, input) do
+      {:all, filter, rest} -> {:ok, filter, rest}
+      {:none, _keys} -> {:ok, nil, input}
+      {:partial, keys} -> missing_lookup_error(keys)
+    end
+  end
+
+  defp fetch_record(resource, exposure, input, ash_opts) do
+    case split_lookup(resource, exposure, input) do
+      {:all, lookup, rest} ->
+        case Ash.get(resource, lookup, ash_opts) do
+          {:ok, record} -> {:ok, record, rest}
+          {:error, error} -> ErrorSerializer.serialize(error)
+        end
+
+      {_, keys} ->
+        missing_lookup_error(keys)
+    end
+  end
+
+  defp split_lookup(resource, exposure, input) do
+    fields = lookup_fields(resource, exposure)
+    keys = Enum.map(fields, &to_string/1)
+    present = Enum.count(keys, &Map.has_key?(input, &1))
+
+    cond do
+      present == 0 ->
+        {:none, keys}
+
+      present == length(keys) ->
+        lookup = Map.new(fields, fn field -> {field, Map.get(input, to_string(field))} end)
+        {:all, lookup, Map.drop(input, keys)}
+
+      true ->
+        {:partial, keys}
+    end
+  end
+
+  defp lookup_fields(resource, %{identity: nil}), do: Ash.Resource.Info.primary_key(resource)
+
+  defp lookup_fields(resource, %{identity: identity}) do
+    Ash.Resource.Info.identity(resource, identity).keys
+  end
+
+  defp missing_lookup_error(keys) do
+    ErrorSerializer.protocol_error(
+      "missing_lookup",
+      "request must include all of #{inspect(keys)} to identify the record"
+    )
   end
 
   ## Reply envelopes
 
   defp ok_reply(data), do: %{"ok" => true, "data" => data}
-
-  defp error_reply(class, message) do
-    %{"ok" => false, "error" => %{"class" => class, "message" => message}}
-  end
-
-  defp error_reply_from(%{class: class} = error) when is_exception(error) do
-    error_reply(to_string(class), Exception.message(error))
-  end
-
-  defp error_reply_from(error) when is_exception(error) do
-    error_reply("error", Exception.message(error))
-  end
-
-  defp error_reply_from(error), do: error_reply("error", inspect(error))
 
   defp encode!(encoder, reply) do
     case encoder.encode_response(reply) do
@@ -320,7 +382,8 @@ defmodule AshNats.Rpc.Server do
 
       {:error, reason} ->
         Logger.error("AshNats.Rpc: failed to encode reply: #{inspect(reason)}")
-        ~s({"ok":false,"error":{"class":"internal_error","message":"encoding failed"}})
+
+        ~s({"ok":false,"error":{"class":"internal_error","message":"encoding failed","errors":[]}})
     end
   end
 end

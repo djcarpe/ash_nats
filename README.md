@@ -16,6 +16,9 @@ def deps do
 end
 ```
 
+Or with [igniter](https://hexdocs.pm/igniter): `mix igniter.install ash_nats` — sets up
+the default connection config, a `Gnat.ConnectionSupervisor`, and the formatter.
+
 ## Connection
 
 Start a Gnat connection (or ConnectionSupervisor) in your supervision tree:
@@ -28,11 +31,25 @@ Start a Gnat connection (or ConnectionSupervisor) in your supervision tree:
  }}
 ```
 
-Either set the connection per-resource in the DSL, or globally:
+Set the connection per-resource in the DSL, per-domain, or globally:
 
 ```elixir
+# per-domain defaults (also: subject_prefix, encoder)
+defmodule MyApp.Shipping do
+  use Ash.Domain, extensions: [AshNats.Domain]
+
+  nats do
+    connection :gnat
+    subject_prefix "myapp.shipping"
+  end
+end
+
+# global fallback
 config :ash_nats, connection: :gnat
 ```
+
+Resolution order for `connection`/`subject_prefix`/`encoder`: resource → domain →
+application env (connection only) / JSON encoder default.
 
 ## Resource DSL
 
@@ -61,7 +78,9 @@ defmodule MyApp.Shipping.Shipment do
 end
 ```
 
-Subject lists join with dots; atom segments resolve from the record at publish time (nil → `_`, and `.`/whitespace/wildcard characters are sanitized). String subjects are used verbatim. `subject_prefix` is prepended to everything, including exposure subjects.
+Subject lists join with dots; atom segments resolve from the record at publish time (nil → `_`, and `.`/whitespace/wildcard characters are sanitized) and must name fields on the resource (verified at compile time). String subjects are used verbatim. `subject_prefix` is prepended to everything, including exposure subjects.
+
+`publish` matches an action by *name* — or, given a type atom (`:create`, `:update`, `:destroy`), every action of that type. `publish_all` is the explicit form for type matching and only accepts type atoms.
 
 ### Event payload
 
@@ -77,7 +96,7 @@ Subject lists join with dots; atom segments resolve from the record at publish t
 }
 ```
 
-`data` contains public attributes only. Loaded relationships/calculations are not traversed — implement a custom `AshNats.Encoder` if you need richer payloads (e.g. protobuf).
+`data` contains public attributes, plus any public relationships/calculations/aggregates that are *loaded* on the record (unloaded fields are omitted). Implement a custom `AshNats.Encoder` if you need a different wire format (e.g. protobuf).
 
 ## Headers
 
@@ -206,11 +225,42 @@ error counter.
 
 Semantics:
 
-- **read** → replies with a list, or a single record/nil with `get?: true`
+- **read** → replies with a list, or a single record/nil with `get?: true`. When a
+  `get?` request includes all primary-key fields (or the fields of the exposure's
+  `identity:` option), they are applied as a filter and removed from the action input;
+  otherwise the input passes through untouched (argument-based get actions still work)
 - **create** → input is changeset input
-- **update/destroy** → input must include the primary key field(s); the record is fetched, remaining keys become action input
+- **update/destroy** → input must include the primary key field(s) (or `identity:`
+  fields); the record is fetched, remaining keys become action input
 - **generic actions** → run via `Ash.ActionInput`
-- errors → `{"ok": false, "error": {"class": "invalid", "message": "..."}}`
+- **load** → `expose ..., load: [:relationship, :calculation]` loads onto successful
+  results before serialization
+
+Errors reply with a structured envelope and never leak internals:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "class": "invalid",
+    "message": "No such input `nope`",
+    "errors": [{"message": "No such input `nope`", "field": "nope"}]
+  }
+}
+```
+
+`class` is the Ash error class (`invalid`, `forbidden`) or a protocol-level code
+(`invalid_request`, `unknown_subject`, `missing_lookup`, `internal_error`).
+`framework`/`unknown` errors are logged server-side and replied with a generic
+message.
+
+## Telemetry
+
+- `[:ash_nats, :publish, :start | :stop | :exception]` — around each publication
+  (metadata: `resource`, `action`, `subject`, `mode`)
+- `[:ash_nats, :rpc, :start | :stop | :exception]` — around each request
+  (metadata: `resource`, `action`, `subject`, and `ok?` on stop)
+- service mode additionally emits gnat's `[:gnat, :service_request]`
 
 ## Delivery semantics (read this)
 

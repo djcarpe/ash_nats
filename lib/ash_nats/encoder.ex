@@ -34,9 +34,9 @@ end
 
 defmodule AshNats.Serializer do
   @moduledoc """
-  Converts Ash records into JSON-safe maps (public attributes only; loaded
-  relationships and calculations are intentionally not traversed — handle those
-  in a custom encoder or a `transform` if you need them).
+  Converts Ash records into JSON-safe maps: public attributes, plus any public
+  relationships, calculations, and aggregates that are loaded (e.g. via the
+  `load` option on `expose`). Fields that aren't loaded are omitted.
   """
 
   def serialize(%Ash.NotLoaded{}), do: nil
@@ -44,10 +44,24 @@ defmodule AshNats.Serializer do
 
   def serialize(%resource{} = record) when is_struct(record) do
     if Ash.Resource.Info.resource?(resource) do
-      resource
-      |> Ash.Resource.Info.public_attributes()
-      |> Map.new(fn %{name: name} ->
-        {to_string(name), encode_value(Map.get(record, name))}
+      attributes =
+        resource
+        |> Ash.Resource.Info.public_attributes()
+        |> Map.new(fn %{name: name} ->
+          {to_string(name), encode_value(Map.get(record, name))}
+        end)
+
+      loadable =
+        Ash.Resource.Info.public_relationships(resource) ++
+          Ash.Resource.Info.public_calculations(resource) ++
+          Ash.Resource.Info.public_aggregates(resource)
+
+      Enum.reduce(loadable, attributes, fn %{name: name}, acc ->
+        case Map.get(record, name) do
+          %Ash.NotLoaded{} -> acc
+          %Ash.ForbiddenField{} -> acc
+          value -> Map.put(acc, to_string(name), encode_value(value))
+        end
       end)
     else
       encode_value(record)

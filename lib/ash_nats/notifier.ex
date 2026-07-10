@@ -8,6 +8,10 @@ defmodule AshNats.Notifier do
   can drop a message. Treat core-mode publications as at-most-once. For
   stronger guarantees, use `mode: :jetstream` (publish-with-ack, still not
   transactional) or pair this with your CDC pipeline as the source of truth.
+
+  Emits `[:ash_nats, :publish, :start | :stop | :exception]` telemetry events
+  around each delivery, with `resource`, `action`, `subject`, and `mode`
+  metadata.
   """
 
   use Ash.Notifier
@@ -27,11 +31,18 @@ defmodule AshNats.Notifier do
     :ok
   end
 
-  defp matches?(%{action: type}, action) when type in [:create, :update, :destroy] do
+  @doc """
+  Whether a publication applies to the given action: `publish_all` matches on
+  action type; `publish` matches on action name, or — when given a type atom
+  (:create, :update, :destroy) — on action type as well.
+  """
+  def matches?(%{all?: true, action: type}, action), do: action.type == type
+
+  def matches?(%{action: type}, action) when type in [:create, :update, :destroy] do
     action.type == type or action.name == type
   end
 
-  defp matches?(%{action: name}, action), do: action.name == name
+  def matches?(%{action: name}, action), do: action.name == name
 
   defp publish(resource, publication, notification) do
     with {:ok, conn} <- fetch_connection(resource),
@@ -41,7 +52,16 @@ defmodule AshNats.Notifier do
         resolve_headers(publication.headers, notification) ++
           msg_id_headers(publication.msg_id, notification)
 
-      do_publish(publication.mode, conn, subject, payload, headers)
+      metadata = %{
+        resource: resource,
+        action: notification.action.name,
+        subject: subject,
+        mode: publication.mode
+      }
+
+      :telemetry.span([:ash_nats, :publish], metadata, fn ->
+        {do_publish(publication.mode, conn, subject, payload, headers), metadata}
+      end)
     else
       {:error, reason} ->
         Logger.error(
@@ -125,9 +145,7 @@ defmodule AshNats.Notifier do
     })
   end
 
-  defp short_name(resource) do
-    resource |> Module.split() |> List.last() |> Macro.underscore()
-  end
+  defp short_name(resource), do: to_string(Ash.Resource.Info.short_name(resource))
 
   defp safe_metadata(metadata) when is_map(metadata) do
     case Jason.encode(metadata) do
@@ -151,7 +169,9 @@ defmodule AshNats.Notifier do
       end
     catch
       :exit, reason ->
-        Logger.error("AshNats: publish to #{subject} failed (connection down): #{inspect(reason)}")
+        Logger.error(
+          "AshNats: publish to #{subject} failed (connection down): #{inspect(reason)}"
+        )
     end
   end
 

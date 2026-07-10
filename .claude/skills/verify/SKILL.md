@@ -46,9 +46,8 @@ a `Supervisor`, then `mix run` it. Gotchas:
 
 ## Gotchas
 
-- `mix format` is broken repo-wide: `.formatter.exs` loads `Spark.Formatter`,
-  which needs the `sourceror` dev dep that isn't declared. Don't add it just
-  to format — write formatted code.
+- If `mix format` raises "Spark.Formatter requires sourceror", the spark dep
+  was compiled before sourceror existed — `mix deps.compile spark --force`.
 - Spark verifier errors (`AshNats.Verifiers.*`) surface as compiler
   diagnostics via `@after_verify`, not exceptions — `assert_raise` around
   `defmodule` won't catch them; call the verifier directly on a modified

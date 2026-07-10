@@ -3,15 +3,26 @@ defmodule AshNats.Publication do
   Target struct for the `publish` and `publish_all` DSL entities.
   """
 
-  defstruct [:action, :subject, :event, :msg_id, :__spark_metadata__, mode: :core, headers: []]
+  defstruct [
+    :action,
+    :subject,
+    :event,
+    :msg_id,
+    :__spark_metadata__,
+    mode: :core,
+    headers: [],
+    all?: false
+  ]
 
   @type t :: %__MODULE__{
           action: atom(),
           subject: String.t() | [String.t() | atom()],
           event: String.t() | nil,
-          msg_id: [String.t() | atom()] | mfa() | (Ash.Notifier.Notification.t() -> String.t()) | nil,
+          msg_id:
+            [String.t() | atom()] | mfa() | (Ash.Notifier.Notification.t() -> String.t()) | nil,
           mode: :core | :jetstream,
-          headers: list() | mfa() | (Ash.Notifier.Notification.t() -> list())
+          headers: list() | mfa() | (Ash.Notifier.Notification.t() -> list()),
+          all?: boolean()
         }
 
   def schema do
@@ -21,7 +32,7 @@ defmodule AshNats.Publication do
         required: true,
         doc: """
         Action name, or an action type (:create, :update, :destroy) to match
-        every action of that type.
+        every action of that type. `publish_all` requires a type.
         """
       ],
       subject: [

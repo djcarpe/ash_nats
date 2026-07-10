@@ -38,9 +38,10 @@ defmodule AshNats do
     Publish a message to a NATS subject when a specific action runs.
 
     The first argument is an action name (or an action type atom — :create,
-    :update, :destroy — to match every action of that type). The second is the
-    subject: a string, or a list of segments where atoms are resolved from the
-    record (e.g. `["shipments", :id, "created"]`).
+    :update, :destroy — to match every action of that type; `publish_all` is
+    the explicit form of that). The second is the subject: a string, or a list
+    of segments where atoms are resolved from the record (e.g.
+    `["shipments", :id, "created"]`).
     """,
     examples: [
       ~S{publish :create, ["shipments", :id, "created"]},
@@ -62,6 +63,7 @@ defmodule AshNats do
     ],
     target: AshNats.Publication,
     args: [:action, :subject],
+    auto_set_fields: [all?: true],
     schema: AshNats.Publication.schema()
   }
 
@@ -113,8 +115,11 @@ defmodule AshNats do
       ],
       encoder: [
         type: {:behaviour, AshNats.Encoder},
-        default: AshNats.Encoder.Json,
-        doc: "Module implementing `AshNats.Encoder` for payload encoding/decoding."
+        doc: """
+        Module implementing `AshNats.Encoder` for payload encoding/decoding.
+        Defaults to the domain's `encoder` (see `AshNats.Domain`), then
+        `AshNats.Encoder.Json`.
+        """
       ],
       publish?: [
         type: :boolean,

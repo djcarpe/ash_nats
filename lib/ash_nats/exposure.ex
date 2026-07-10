@@ -4,12 +4,14 @@ defmodule AshNats.Exposure do
   request/reply.
   """
 
-  defstruct [:action, :subject, :endpoint, :__spark_metadata__, get?: false]
+  defstruct [:action, :subject, :endpoint, :identity, :load, :__spark_metadata__, get?: false]
 
   @type t :: %__MODULE__{
           action: atom(),
           subject: String.t() | nil,
           endpoint: String.t() | nil,
+          identity: atom() | nil,
+          load: term() | nil,
           get?: boolean()
         }
 
@@ -39,7 +41,22 @@ defmodule AshNats.Exposure do
         default: false,
         doc: """
         For read actions: reply with a single record (Ash.read_one) instead of
-        a list.
+        a list. When the request includes all lookup keys (primary key, or the
+        `identity` option), they are applied as a filter.
+        """
+      ],
+      identity: [
+        type: :atom,
+        doc: """
+        Identity used to look up the record (for `get?: true` reads and
+        update/destroy exposures) instead of the primary key.
+        """
+      ],
+      load: [
+        type: :any,
+        doc: """
+        An Ash load statement applied to successful results before they are
+        serialized into the reply (relationships, calculations, aggregates).
         """
       ]
     ]

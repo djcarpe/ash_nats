@@ -1,7 +1,15 @@
 defmodule AshNats.Info do
   @moduledoc """
   Introspection for the `nats` section of resources using `AshNats`.
+
+  Alongside the helpers below, `Spark.InfoGenerator` provides the raw option
+  accessors (`nats_connection/1`, `nats_subject_prefix/1`, `nats_encoder/1`,
+  `nats_publish?/1`). Prefer `connection/1`, `subject_prefix/1`, and
+  `encoder/1`, which also apply the domain-level defaults from
+  `AshNats.Domain` and the application environment.
   """
+
+  use Spark.InfoGenerator, extension: AshNats, sections: [:nats]
 
   alias Spark.Dsl.Extension
 
@@ -10,30 +18,41 @@ defmodule AshNats.Info do
     AshNats in Spark.extensions(resource)
   end
 
-  @doc "The Gnat connection name, falling back to `config :ash_nats, :connection`."
+  @doc """
+  The Gnat connection name: the resource's `connection`, the domain's (see
+  `AshNats.Domain`), or `config :ash_nats, :connection`.
+  """
   def connection(resource) do
-    Extension.get_opt(
-      resource,
-      [:nats],
-      :connection,
+    with :error <- nats_connection(resource),
+         :error <- domain_opt(resource, &AshNats.Domain.Info.nats_connection/1) do
       Application.get_env(:ash_nats, :connection)
-    )
+    else
+      {:ok, connection} -> connection
+    end
   end
 
-  @doc "The subject prefix for the resource, or nil."
+  @doc "The subject prefix: the resource's `subject_prefix` or the domain's, or nil."
   def subject_prefix(resource) do
-    Extension.get_opt(resource, [:nats], :subject_prefix, nil)
+    with :error <- nats_subject_prefix(resource),
+         :error <- domain_opt(resource, &AshNats.Domain.Info.nats_subject_prefix/1) do
+      nil
+    else
+      {:ok, prefix} -> prefix
+    end
   end
 
-  @doc "The payload encoder module."
+  @doc "The payload encoder: the resource's `encoder` or the domain's, defaulting to JSON."
   def encoder(resource) do
-    Extension.get_opt(resource, [:nats], :encoder, AshNats.Encoder.Json)
+    with :error <- nats_encoder(resource),
+         :error <- domain_opt(resource, &AshNats.Domain.Info.nats_encoder/1) do
+      AshNats.Encoder.Json
+    else
+      {:ok, encoder} -> encoder
+    end
   end
 
   @doc "Whether publications are enabled for the resource."
-  def publish?(resource) do
-    Extension.get_opt(resource, [:nats], :publish?, true)
-  end
+  def publish?(resource), do: nats_publish?(resource)
 
   @doc "All configured publications."
   def publications(resource) do
@@ -72,4 +91,15 @@ defmodule AshNats.Info do
       "#{Ash.Resource.Info.short_name(resource)}_#{exposure.action}"
       |> String.replace(~r/[^a-zA-Z0-9_-]/, "_")
   end
+
+  defp domain_opt(resource, fetcher) when is_atom(resource) do
+    with domain when not is_nil(domain) <- Ash.Resource.Info.domain(resource),
+         true <- AshNats.Domain in Spark.extensions(domain) do
+      fetcher.(domain)
+    else
+      _ -> :error
+    end
+  end
+
+  defp domain_opt(_resource, _fetcher), do: :error
 end
