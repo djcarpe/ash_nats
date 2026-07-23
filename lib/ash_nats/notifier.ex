@@ -21,11 +21,20 @@ defmodule AshNats.Notifier do
 
   @impl true
   def notify(%Ash.Notifier.Notification{resource: resource} = notification) do
-    if AshNats.Info.nats?(resource) and AshNats.Info.publish?(resource) do
-      resource
-      |> AshNats.Info.publications()
-      |> Enum.filter(&matches?(&1, notification.action))
-      |> Enum.each(&publish(resource, &1, notification))
+    cond do
+      not (AshNats.Info.nats?(resource) and AshNats.Info.publish?(resource)) ->
+        :ok
+
+      not AshNats.Info.connection_registered?(resource) ->
+        Logger.debug(fn ->
+          "AshNats: skipping publish for #{inspect(resource)}, connection not registered"
+        end)
+
+      true ->
+        resource
+        |> AshNats.Info.publications()
+        |> Enum.filter(&matches?(&1, notification.action))
+        |> Enum.each(&publish(resource, &1, notification))
     end
 
     :ok
@@ -46,7 +55,8 @@ defmodule AshNats.Notifier do
 
   defp publish(resource, publication, notification) do
     with {:ok, conn} <- fetch_connection(resource),
-         {:ok, subject} <- build_subject(resource, publication, notification.data),
+         {:ok, subject} <-
+           build_subject(resource, publication, notification.action, notification.data),
          {:ok, payload} <- encode_payload(resource, publication, notification) do
       headers =
         resolve_headers(publication.headers, notification) ++
@@ -100,7 +110,7 @@ defmodule AshNats.Notifier do
     end
   end
 
-  defp build_subject(resource, %{subject: subject}, record) do
+  defp build_subject(resource, %{subject: subject}, action, record) do
     base =
       case subject do
         binary when is_binary(binary) ->
@@ -108,7 +118,7 @@ defmodule AshNats.Notifier do
 
         segments when is_list(segments) ->
           segments
-          |> Enum.map(&resolve_segment(&1, record))
+          |> Enum.map(&resolve_subject_segment(&1, resource, action, record))
           |> Enum.join(".")
       end
 
@@ -118,14 +128,35 @@ defmodule AshNats.Notifier do
     end
   end
 
+  # `:_resource`, `:_action`, and `:_pkey` are resolved with access to the
+  # resource and the concrete action that fired, rather than just the
+  # record's fields.
+  defp resolve_subject_segment(:_resource, resource, _action, _record),
+    do: resource |> short_name() |> sanitize()
+
+  defp resolve_subject_segment(:_action, _resource, action, _record),
+    do: action.name |> to_string() |> sanitize()
+
+  defp resolve_subject_segment(:_pkey, resource, _action, record) do
+    resource
+    |> Ash.Resource.Info.primary_key()
+    |> Enum.map(&resolve_segment(&1, record))
+    |> Enum.join("-")
+  end
+
+  defp resolve_subject_segment(segment, _resource, _action, record),
+    do: resolve_segment(segment, record)
+
   defp resolve_segment(segment, _record) when is_binary(segment), do: segment
 
   defp resolve_segment(segment, record) when is_atom(segment) do
     case Map.get(record, segment) do
       nil -> "_"
-      value -> value |> to_string() |> String.replace(~r/[.\s>*]/, "_")
+      value -> value |> to_string() |> sanitize()
     end
   end
+
+  defp sanitize(string), do: String.replace(string, ~r/[.\s>*]/, "_")
 
   defp encode_payload(resource, publication, notification) do
     encoder = AshNats.Info.encoder(resource)

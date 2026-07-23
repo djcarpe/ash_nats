@@ -1,6 +1,8 @@
 defmodule AshNatsTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   defmodule Order do
     use Ash.Resource,
       domain: AshNatsTest.Domain,
@@ -92,6 +94,83 @@ defmodule AshNatsTest do
 
     actions do
       defaults [:read, :create]
+    end
+  end
+
+  # A minimal Gnat stand-in: registers under a name like a real connection and
+  # replies :ok to `Gnat.pub/4` calls, forwarding what was published to the
+  # test process so assertions don't need a live NATS server.
+  defmodule FakeGnat do
+    use GenServer
+
+    def start_link({name, parent}), do: GenServer.start_link(__MODULE__, parent, name: name)
+
+    @impl true
+    def init(parent), do: {:ok, parent}
+
+    @impl true
+    def handle_call({:pub, topic, message, opts}, _from, parent) do
+      send(parent, {:published, topic, message, opts})
+      {:reply, :ok, parent}
+    end
+  end
+
+  defmodule WorkElement do
+    use Ash.Resource,
+      domain: AshNatsTest.TemplateDomain,
+      data_layer: Ash.DataLayer.Ets,
+      extensions: [AshNats]
+
+    nats do
+      connection :fake_gnat_work_element
+      subject_prefix "boe"
+
+      publish :create, [:_resource, :_action, :_pkey]
+    end
+
+    attributes do
+      uuid_primary_key :id
+    end
+
+    actions do
+      defaults [:create]
+    end
+  end
+
+  defmodule Shipment do
+    use Ash.Resource,
+      domain: AshNatsTest.TemplateDomain,
+      data_layer: Ash.DataLayer.Ets,
+      extensions: [AshNats]
+
+    nats do
+      connection :fake_gnat_shipment
+      subject_prefix "boe"
+
+      publish :create, [:_resource, :_action, :_pkey]
+    end
+
+    attributes do
+      attribute :tracking_number, :string,
+        primary_key?: true,
+        allow_nil?: false,
+        writable?: true,
+        public?: true
+    end
+
+    actions do
+      create :create do
+        accept [:tracking_number]
+      end
+    end
+  end
+
+  defmodule TemplateDomain do
+    use Ash.Domain, validate_config_inclusion?: false
+
+    resources do
+      resource AshNatsTest.WorkElement
+      resource AshNatsTest.Shipment
     end
   end
 
@@ -365,6 +444,64 @@ defmodule AshNatsTest do
 
       loaded = Ash.load!(order, [:shouty])
       assert AshNats.Serializer.serialize(loaded)["shouty"] == "open!"
+    end
+  end
+
+  describe "subject template segments" do
+    test "resource/action/pkey segments build DOMAIN.RESOURCE.ACTION.ID" do
+      start_supervised!({FakeGnat, {:fake_gnat_work_element, self()}})
+
+      element =
+        WorkElement
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      assert_receive {:published, topic, _message, _opts}
+      assert topic == "boe.work_element.create.#{element.id}"
+    end
+
+    test "works for a resource whose primary key is not :id" do
+      start_supervised!({FakeGnat, {:fake_gnat_shipment, self()}})
+
+      Shipment
+      |> Ash.Changeset.for_create(:create, %{tracking_number: "T-123"})
+      |> Ash.create!()
+
+      assert_receive {:published, topic, _message, _opts}
+      assert topic == "boe.shipment.create.T-123"
+    end
+  end
+
+  describe "connection registration guard" do
+    test "publishing is a silent no-op when the connection is not registered" do
+      refute Process.whereis(:gnat_test)
+
+      log =
+        capture_log(fn ->
+          Order
+          |> Ash.Changeset.for_create(:create, %{status: "open"})
+          |> Ash.create!()
+        end)
+
+      refute log =~ "[error]"
+      refute log =~ "[warning]"
+    end
+
+    test "publishing proceeds when the connection is registered" do
+      start_supervised!({FakeGnat, {:fake_gnat_work_element, self()}})
+
+      log =
+        capture_log(fn ->
+          WorkElement
+          |> Ash.Changeset.for_create(:create, %{})
+          |> Ash.create!()
+
+          assert_receive {:published, topic, _message, _opts}
+          assert topic =~ "boe.work_element.create."
+        end)
+
+      refute log =~ "[error]"
+      refute log =~ "[warning]"
     end
   end
 end

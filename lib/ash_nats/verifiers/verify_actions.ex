@@ -18,6 +18,7 @@ defmodule AshNats.Verifiers.VerifyActions do
   alias Spark.Error.DslError
 
   @types [:create, :update, :destroy]
+  @special_subject_segments [:_resource, :_action, :_pkey]
 
   @impl true
   def verify(dsl_state) do
@@ -71,7 +72,8 @@ defmodule AshNats.Verifiers.VerifyActions do
 
     Enum.find_value(publications, :ok, fn publication ->
       bad =
-        (atom_segments(publication.subject) ++ atom_segments(publication.msg_id))
+        ((atom_segments(publication.subject) -- @special_subject_segments) ++
+           atom_segments(publication.msg_id))
         |> Enum.reject(&MapSet.member?(fields, &1))
 
       case bad do

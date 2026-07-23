@@ -31,6 +31,33 @@ defmodule AshNats.Info do
     end
   end
 
+  @doc """
+  Whether the resource's configured connection process is currently
+  registered and alive. `false` when no connection is configured, when an
+  atom connection name isn't registered to a live process, when a `pid` is
+  dead, or when a `{:via, _, _}` tuple doesn't resolve. Used to silently skip
+  publishing when NATS isn't wired up (e.g. in environments where no Gnat
+  connection is started).
+  """
+  def connection_registered?(resource) do
+    case connection(resource) do
+      nil ->
+        false
+
+      name when is_atom(name) ->
+        is_pid(Process.whereis(name))
+
+      pid when is_pid(pid) ->
+        Process.alive?(pid)
+
+      {:via, _, _} = via ->
+        is_pid(GenServer.whereis(via))
+
+      _other ->
+        true
+    end
+  end
+
   @doc "The subject prefix: the resource's `subject_prefix` or the domain's, or nil."
   def subject_prefix(resource) do
     with :error <- nats_subject_prefix(resource),

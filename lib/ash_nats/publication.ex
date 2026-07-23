@@ -41,7 +41,13 @@ defmodule AshNats.Publication do
         doc: """
         Subject to publish to. A string is used verbatim (after the resource's
         subject_prefix). A list of segments is joined with dots; atom segments
-        are resolved from the record's fields at publish time.
+        are resolved from the record's fields at publish time. Three special
+        segments give a shared template access to the resource and action
+        that fired, not just the record: `:_resource` (the resource's short
+        name), `:_action` (the concrete action name), and `:_pkey` (the
+        primary key value(s), joined with "-" for composite keys) — e.g.
+        `[:_resource, :_action, :_pkey]` with `subject_prefix "boe"` produces
+        `"boe.work_element.create.<pkey>"`.
         """
       ],
       mode: [
